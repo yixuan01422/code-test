@@ -1,14 +1,37 @@
 import torch
 import torch.nn as nn
 from transformers import GPT2Model, GPT2Tokenizer
+from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2MLP
 from typing import Dict, Optional
+import torch.ao.quantization as quantization
 
-def symmetric_quantize(x: torch.Tensor, bits: int = 8):
-    max_val = torch.max(torch.abs(x))
+def symmetric_quantize(x: torch.Tensor, bits: int = 8, per_channel: bool = False):
+    if per_channel:
+        # Per-channel quantization for weights
+        # x shape: [out_features, in_features]
+        max_val = torch.max(torch.abs(x), dim=1, keepdim=True)[0]
+    else:
+        # Per-token quantization for activations and KV cache
+        # x shape: [batch_size, sequence_length, hidden_size]
+        max_val = torch.max(torch.abs(x), dim=2, keepdim=True)[0]  # max along hidden_size
+        max_val = torch.max(max_val, dim=1, keepdim=True)[0]  # max along sequence_length
     scale = max_val / (2 ** (bits - 1) - 1)
     x_quant = torch.round(x / scale)
     x_quant = torch.clamp(x_quant, -2 ** (bits - 1), 2 ** (bits - 1) - 1)
-    return x_quant * scale
+    
+    # Use PyTorch's quantization
+    if bits == 4:
+        # Use int4 quantization
+        qscheme = quantization.QScheme.PER_CHANNEL_AFFINE if per_channel else quantization.QScheme.PER_TENSOR_AFFINE
+        return quantization.QuantizedTensor(x_quant * scale, scale=scale, zero_point=0, 
+                                         dtype=torch.qint4x2, qscheme=qscheme)
+    elif bits == 8:
+        # Use int8 quantization
+        qscheme = quantization.QScheme.PER_CHANNEL_AFFINE if per_channel else quantization.QScheme.PER_TENSOR_AFFINE
+        return quantization.QuantizedTensor(x_quant * scale, scale=scale, zero_point=0, 
+                                         dtype=torch.qint8, qscheme=qscheme)
+    else:
+        raise ValueError("Only 4-bit and 8-bit quantization supported")
 
 class QuantizedLayer(nn.Module):
     def __init__(self, original_layer, bits: int = 8):
@@ -17,7 +40,8 @@ class QuantizedLayer(nn.Module):
         self.in_features = original_layer.nx
         self.out_features = original_layer.nf
         self.bias = original_layer.bias
-        self.quantized_weight = symmetric_quantize(original_layer.weight, bits)
+        # Use per-channel quantization for weights
+        self.quantized_weight = symmetric_quantize(original_layer.weight, bits, per_channel=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         size_out = x.size()[:-1] + (self.out_features,)
@@ -29,20 +53,27 @@ class ActivationQuantizer(nn.Module):
     def __init__(self, bits: int = 8):
         super().__init__()
         self.bits = bits
+        # Use dynamic quantization for activations
+        self.quantize = quantization.Quantize(
+            dtype=torch.qint8 if bits == 8 else torch.qint4x2,
+            qscheme=quantization.QScheme.PER_TENSOR_AFFINE
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return symmetric_quantize(x, self.bits)
+        return self.quantize(x)
 
 class KVCacheQuantizer(nn.Module):
     def __init__(self, bits: int = 8):
         super().__init__()
         self.bits = bits
+        # Use dynamic quantization for KV cache
+        self.quantize = quantization.Quantize(
+            dtype=torch.qint8 if bits == 8 else torch.qint4x2,
+            qscheme=quantization.QScheme.PER_TENSOR_AFFINE
+        )
 
     def forward(self, k: torch.Tensor, v: torch.Tensor) -> tuple:
-        # Quantize K and V cache separately
-        k_quant = symmetric_quantize(k, self.bits)
-        v_quant = symmetric_quantize(v, self.bits)
-        return k_quant, v_quant
+        return self.quantize(k), self.quantize(v)
 
 class QuantizedAttention(nn.Module):
     def __init__(self, original_attn, weight_bits: int = 8, act_bits: int = 8, kv_bits: int = 8):
@@ -58,8 +89,8 @@ class QuantizedAttention(nn.Module):
         
         # Original attention parameters
         self.num_heads = original_attn.num_heads
-        self.split_size = original_attn.split_size
-        self.scale = original_attn.scale
+        self.head_dim = original_attn.head_dim
+        self.scale = 1.0 / (self.head_dim ** 0.5)
         
     def _split_heads(self, x, num_heads, head_dim):
         new_shape = x.size()[:-1] + (num_heads, head_dim)
@@ -67,12 +98,12 @@ class QuantizedAttention(nn.Module):
         return x.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_dim)
 
     def forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None):
-        query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+        query, key, value = self.c_attn(hidden_states).split(self.head_dim * self.num_heads, dim=2)
         
         # Split heads
-        query = self._split_heads(query, self.num_heads, self.split_size // self.num_heads)
-        key = self._split_heads(key, self.num_heads, self.split_size // self.num_heads)
-        value = self._split_heads(value, self.num_heads, self.split_size // self.num_heads)
+        query = self._split_heads(query, self.num_heads, self.head_dim)
+        key = self._split_heads(key, self.num_heads, self.head_dim)
+        value = self._split_heads(value, self.num_heads, self.head_dim)
 
         if layer_past is not None:
             past_key, past_value = layer_past
@@ -98,7 +129,7 @@ class QuantizedAttention(nn.Module):
         # Combine heads
         attn_output = torch.matmul(attn_output, value)
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
-        attn_output = attn_output.view(attn_output.size()[:-2] + (self.num_heads * self.split_size // self.num_heads,))
+        attn_output = attn_output.view(attn_output.size()[:-2] + (self.num_heads * self.head_dim,))
 
         # Output projection and quantization
         attn_output = self.act_quantizer(attn_output)
@@ -108,102 +139,82 @@ class QuantizedAttention(nn.Module):
         return attn_output, present
 
 class QuantizedGPT2(nn.Module):
-    def __init__(self, model_name: str = 'gpt2', bit_config: Optional[Dict] = None):
+    def __init__(self, model_name: str = 'gpt2', weight_bits: int = 8, act_bits: int = 8, kv_bits: int = 8):
         super().__init__()
         self.model = GPT2Model.from_pretrained(model_name)
-        self.bit_config = bit_config
+        self.weight_bits = weight_bits
+        self.act_bits = act_bits
+        self.kv_bits = kv_bits
         self._quantize_model()
 
     def _quantize_model(self):
         for name, module in self.model.named_modules():
             if isinstance(module, nn.Module):
-                if hasattr(module, 'nf'):
-                    for pattern, bits in self.bit_config["weight"].items():
-                        if name.endswith(pattern):
-                            parent = self._get_parent_module(name)
-                            if 'attn' in pattern and hasattr(parent, 'attn'):
-                                # Replace entire attention block
-                                weight_bits = self.bit_config["weight"][pattern]
-                                act_bits = self.bit_config["activation"].get(pattern, 8)
-                                kv_bits = self.bit_config.get("kv_cache", {}).get(pattern, 8)
-                                quant_attn = QuantizedAttention(parent.attn, weight_bits, act_bits, kv_bits)
-                                setattr(parent, 'attn', quant_attn)
-                            else:
-                                # Regular layer quantization
-                                quant_layer = QuantizedLayer(module, bits)
-                                setattr(parent, name.split('.')[-1], quant_layer)
-                                
-                                if pattern in self.bit_config.get("activation", {}):
-                                    act_bits = self.bit_config["activation"][pattern]
-                                    quantizer = ActivationQuantizer(act_bits)
-                                    setattr(parent, f"{name.split('.')[-1]}_act_quant", quantizer)
-                                    self._modify_forward_pass(parent, name.split('.')[-1])
-                            break
+                # Handle attention blocks
+                if isinstance(module, GPT2Attention):
+                    # Replace the entire attention block with quantized version
+                    module.attn = QuantizedAttention(
+                        module, 
+                        self.weight_bits, 
+                        self.act_bits, 
+                        self.kv_bits
+                    )
+                
+                # Handle MLP blocks
+                elif isinstance(module, GPT2MLP):
+                    # Quantize the MLP layers
+                    quant_c_fc = QuantizedLayer(module.c_fc, self.weight_bits)
+                    quant_c_proj = QuantizedLayer(module.c_proj, self.weight_bits)
+                    
+                    # Add activation quantizers
+                    act_quantizer = ActivationQuantizer(self.act_bits)
+                    
+                    # Replace the layers
+                    module.c_fc = quant_c_fc
+                    module.c_proj = quant_c_proj
+                    
+                    # Store the activation quantizer
+                    module.act_quantizer = act_quantizer
+                    
+                    # Modify the forward pass to include activation quantization
+                    original_forward = module.forward
+                    def new_forward(*args, **kwargs):
+                        x = original_forward(*args, **kwargs)
+                        return module.act_quantizer(x)
+                    module.forward = new_forward
 
-    def _modify_forward_pass(self, parent_module, layer_name):
-        original_forward = parent_module.forward
-        quantizer = getattr(parent_module, f"{layer_name}_act_quant")
-        
-        def new_forward(*args, **kwargs):
-            outputs = original_forward(*args, **kwargs)
-            if isinstance(outputs, tuple):
-                return (quantizer(outputs[0]),) + outputs[1:]
-            return quantizer(outputs)
-            
-        parent_module.forward = new_forward
-
-    def _get_parent_module(self, name: str) -> nn.Module:
-        if not name:
-            return self.model
-        parts = name.split('.')
-        current = self.model
-        for part in parts:
-            current = getattr(current, part)
-        return current
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
 if __name__ == "__main__":
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    bit_config = {
-        "weight": {
-            'attn.c_attn': 4,
-            'attn.c_proj': 8,
-            'mlp.c_fc': 6,
-            'mlp.c_proj': 8
-        },
-        "activation": {
-            'attn.c_attn': 8,
-            'attn.c_proj': 8,
-            'mlp.c_fc': 8,
-            'mlp.c_proj': 8
-        },
-        "kv_cache": {
-            'attn.c_attn': 8  # 8-bit quantization for KV cache
-        }
-    }
     
-    model = QuantizedGPT2(bit_config=bit_config)
-    model.eval()
+    # Initialize model with uniform bit widths
+    model = QuantizedGPT2(
+        weight_bits=8,  # All weights use 8 bits
+        act_bits=8,     # All activations use 8 bits
+        kv_bits=8       # All KV cache use 8 bits
+    )
+    # model.eval()
 
-    text = "Hello, I am a language model that has been"
-    inputs = tokenizer(text, return_tensors="pt")
+    # text = "Hello, I am a language model that has been"
+    # inputs = tokenizer(text, return_tensors="pt")
     
-    with torch.no_grad():
-        outputs = model(**inputs)
-        hidden_states = outputs.last_hidden_state
+    # with torch.no_grad():
+    #     outputs = model(**inputs)
+    #     hidden_states = outputs.last_hidden_state
     
-    print(f"\nInput text: {text}")
-    print(f"Output shape: {hidden_states.shape}")
-    print(f"Sample output values:\n{hidden_states[0, 0, :10]}")
+    # print(f"\nInput text: {text}")
+    # print(f"Output shape: {hidden_states.shape}")
+    # print(f"Sample output values:\n{hidden_states[0, 0, :10]}")
 
-    def print_layer_info(name, module):
-        if hasattr(module, 'bits'):
-            print(f"\nLayer: {name}")
-            print(f"Quantization bits: {module.bits}")
-            if hasattr(module, 'quantized_weight'):
-                print(f"Weight shape: {module.quantized_weight.shape}")
+    # def print_layer_info(name, module):
+    #     if hasattr(module, 'bits'):
+    #         print(f"\nLayer: {name}")
+    #         print(f"Quantization bits: {module.bits}")
+    #         if hasattr(module, 'quantized_weight'):
+    #             print(f"Weight shape: {module.quantized_weight.shape}")
 
-    for name, module in model.named_modules():
-        print_layer_info(name, module)
+    # for name, module in model.named_modules():
+    #     print_layer_info(name, module)

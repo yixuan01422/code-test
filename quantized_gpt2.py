@@ -3,31 +3,49 @@ import torch.nn as nn
 from transformers import GPT2Model, GPT2Tokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2MLP
 from typing import Dict, Optional
+from quantize import Quantize, calculate_qparams
 
 def symmetric_quantize(x: torch.Tensor, bits: int = 8, per_channel: bool = False):
     if per_channel:
         # Per-channel quantization for weights
         # x shape: [out_features, in_features]
-        max_val = torch.amax(torch.abs(x), dim=1, keepdim=True)
+        # Compute stats independently for each output channel
+        qparams = calculate_qparams(
+            x, 
+            num_bits=bits, 
+            flatten_dims=(1, -1),  # Flatten all dims except channel dim
+            reduce_dim=0,  # Reduce across channel dimension
+            reduce_type='extreme'  # Use min/max for better precision
+        )
+        return Quantize(x, qparams=qparams, dequantize=True, signed=True)
     else:
-        # Per-token quantization for activations and KV cache
+        # Per-tensor quantization for activations and KV cache
         # x shape: [batch_size, sequence_length, hidden_size]
-        max_val = torch.amax(torch.abs(x), dim=2, keepdim=True)  # max along hidden_size
-        max_val = torch.amax(max_val, dim=1, keepdim=True)  # max along sequence_length
-    scale = max_val / (2 ** (bits - 1) - 1)
-    x_quant = torch.round(x / scale)
-    x_quant = torch.clamp(x_quant, -2 ** (bits - 1), 2 ** (bits - 1) - 1)
-    return x_quant * scale
+        # Compute stats across the entire tensor
+        qparams = calculate_qparams(
+            x, 
+            num_bits=bits,
+            flatten_dims=(0, -1),  # Flatten entire tensor
+            reduce_dim=None,  # Global stats
+            reduce_type='extreme'  # Use min/max for better precision
+        )
+        return Quantize(x, qparams=qparams, dequantize=True, signed=True)
 
 class QuantizedLayer(nn.Module):
     def __init__(self, original_layer, bits: int = 8):
         super().__init__()
         self.bits = bits
-        self.in_features = original_layer.nx
-        self.out_features = original_layer.nf
+        weight = original_layer.weight
+        # For c_attn layer, weight shape should be [768, 2304] -> [2304, 768]
+        if weight.size(1) == 2304:  # This is the c_attn layer
+            weight = weight.transpose(0, 1)
+        self.in_features = weight.size(1)
+        self.out_features = weight.size(0)
         self.bias = original_layer.bias
+        if self.bias is not None and weight.size(1) == 2304:  # For c_attn layer
+            self.bias = self.bias.view(self.out_features)
         # Use per-channel quantization for weights
-        self.quantized_weight = symmetric_quantize(original_layer.weight, bits, per_channel=True)
+        self.quantized_weight = symmetric_quantize(weight, bits, per_channel=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         size_out = x.size()[:-1] + (self.out_features,)
@@ -54,27 +72,40 @@ class KVCacheQuantizer(nn.Module):
 class QuantizedAttention(nn.Module):
     def __init__(self, original_attn, weight_bits: int = 8, act_bits: int = 8, kv_bits: int = 8):
         super().__init__()
+        config = original_attn.config
+        self.num_heads = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.embed_dim = config.n_embd
+        
+        # Print dimensions for debugging
+        print(f"Attention dimensions:")
+        print(f"- Embed dim: {self.embed_dim}")
+        print(f"- Num heads: {self.num_heads}")
+        print(f"- Head dim: {self.head_dim}")
+        print(f"- QKV dim: {3 * self.embed_dim}")
+        
+        # Initialize quantized layers with correct dimensions
         self.c_attn = QuantizedLayer(original_attn.c_attn, weight_bits)
         self.c_proj = QuantizedLayer(original_attn.c_proj, weight_bits)
+        
+        # Original attention parameters
+        self.scale = 1.0 / (self.head_dim ** 0.5)
         self.attn_dropout = original_attn.attn_dropout
         self.resid_dropout = original_attn.resid_dropout
         
         # Quantizers
         self.act_quantizer = ActivationQuantizer(act_bits)
         self.kv_cache_quantizer = KVCacheQuantizer(kv_bits)
-        
-        # Original attention parameters
-        self.num_heads = original_attn.num_heads
-        self.head_dim = original_attn.head_dim
-        self.scale = 1.0 / (self.head_dim ** 0.5)
-        
+
     def _split_heads(self, x, num_heads, head_dim):
         new_shape = x.size()[:-1] + (num_heads, head_dim)
         x = x.view(new_shape)
         return x.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_dim)
 
     def forward(self, hidden_states, layer_past=None, attention_mask=None, head_mask=None):
-        query, key, value = self.c_attn(hidden_states).split(self.head_dim * self.num_heads, dim=2)
+        qkv = self.c_attn(hidden_states)
+        all_head_size = self.num_heads * self.head_dim
+        query, key, value = qkv.split(all_head_size, dim=2)
         
         # Split heads
         query = self._split_heads(query, self.num_heads, self.head_dim)
@@ -105,7 +136,7 @@ class QuantizedAttention(nn.Module):
         # Combine heads
         attn_output = torch.matmul(attn_output, value)
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
-        attn_output = attn_output.view(attn_output.size()[:-2] + (self.num_heads * self.head_dim,))
+        attn_output = attn_output.view(attn_output.size()[:-2] + (self.embed_dim,))
 
         # Output projection and quantization
         attn_output = self.act_quantizer(attn_output)
@@ -164,33 +195,4 @@ class QuantizedGPT2(nn.Module):
         return self.model(*args, **kwargs)
 
 if __name__ == "__main__":
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    
-    # Initialize model with uniform bit widths
-    model = QuantizedGPT2(
-        weight_bits=8,  # All weights use 8 bits
-        act_bits=8,     # All activations use 8 bits
-        kv_bits=8       # All KV cache use 8 bits
-    )
-    # model.eval()
-
-    # text = "Hello, I am a language model that has been"
-    # inputs = tokenizer(text, return_tensors="pt")
-    
-    # with torch.no_grad():
-    #     outputs = model(**inputs)
-    #     hidden_states = outputs.last_hidden_state
-    
-    # print(f"\nInput text: {text}")
-    # print(f"Output shape: {hidden_states.shape}")
-    # print(f"Sample output values:\n{hidden_states[0, 0, :10]}")
-
-    # def print_layer_info(name, module):
-    #     if hasattr(module, 'bits'):
-    #         print(f"\nLayer: {name}")
-    #         print(f"Quantization bits: {module.bits}")
-    #         if hasattr(module, 'quantized_weight'):
-    #             print(f"Weight shape: {module.quantized_weight.shape}")
-
-    # for name, module in model.named_modules():
-    #     print_layer_info(name, module)
+    pass

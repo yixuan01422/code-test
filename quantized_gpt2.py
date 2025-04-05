@@ -3,35 +3,21 @@ import torch.nn as nn
 from transformers import GPT2Model, GPT2Tokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention, GPT2MLP
 from typing import Dict, Optional
-import torch.ao.quantization as quantization
 
 def symmetric_quantize(x: torch.Tensor, bits: int = 8, per_channel: bool = False):
     if per_channel:
         # Per-channel quantization for weights
         # x shape: [out_features, in_features]
-        max_val = torch.max(torch.abs(x), dim=1, keepdim=True)[0]
+        max_val = torch.amax(torch.abs(x), dim=1, keepdim=True)
     else:
         # Per-token quantization for activations and KV cache
         # x shape: [batch_size, sequence_length, hidden_size]
-        max_val = torch.max(torch.abs(x), dim=2, keepdim=True)[0]  # max along hidden_size
-        max_val = torch.max(max_val, dim=1, keepdim=True)[0]  # max along sequence_length
+        max_val = torch.amax(torch.abs(x), dim=2, keepdim=True)  # max along hidden_size
+        max_val = torch.amax(max_val, dim=1, keepdim=True)  # max along sequence_length
     scale = max_val / (2 ** (bits - 1) - 1)
     x_quant = torch.round(x / scale)
     x_quant = torch.clamp(x_quant, -2 ** (bits - 1), 2 ** (bits - 1) - 1)
-    
-    # Use PyTorch's quantization
-    if bits == 4:
-        # Use int4 quantization
-        qscheme = quantization.QScheme.PER_CHANNEL_AFFINE if per_channel else quantization.QScheme.PER_TENSOR_AFFINE
-        return quantization.QuantizedTensor(x_quant * scale, scale=scale, zero_point=0, 
-                                         dtype=torch.qint4x2, qscheme=qscheme)
-    elif bits == 8:
-        # Use int8 quantization
-        qscheme = quantization.QScheme.PER_CHANNEL_AFFINE if per_channel else quantization.QScheme.PER_TENSOR_AFFINE
-        return quantization.QuantizedTensor(x_quant * scale, scale=scale, zero_point=0, 
-                                         dtype=torch.qint8, qscheme=qscheme)
-    else:
-        raise ValueError("Only 4-bit and 8-bit quantization supported")
+    return x_quant * scale
 
 class QuantizedLayer(nn.Module):
     def __init__(self, original_layer, bits: int = 8):
@@ -53,27 +39,17 @@ class ActivationQuantizer(nn.Module):
     def __init__(self, bits: int = 8):
         super().__init__()
         self.bits = bits
-        # Use dynamic quantization for activations
-        self.quantize = quantization.Quantize(
-            dtype=torch.qint8 if bits == 8 else torch.qint4x2,
-            qscheme=quantization.QScheme.PER_TENSOR_AFFINE
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.quantize(x)
+        return symmetric_quantize(x, self.bits, per_channel=False)
 
 class KVCacheQuantizer(nn.Module):
     def __init__(self, bits: int = 8):
         super().__init__()
         self.bits = bits
-        # Use dynamic quantization for KV cache
-        self.quantize = quantization.Quantize(
-            dtype=torch.qint8 if bits == 8 else torch.qint4x2,
-            qscheme=quantization.QScheme.PER_TENSOR_AFFINE
-        )
 
     def forward(self, k: torch.Tensor, v: torch.Tensor) -> tuple:
-        return self.quantize(k), self.quantize(v)
+        return symmetric_quantize(k, self.bits, per_channel=False), symmetric_quantize(v, self.bits, per_channel=False)
 
 class QuantizedAttention(nn.Module):
     def __init__(self, original_attn, weight_bits: int = 8, act_bits: int = 8, kv_bits: int = 8):

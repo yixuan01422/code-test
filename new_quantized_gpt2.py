@@ -24,13 +24,15 @@ class QuantizeLinearSwitchable(nn.Module):
                                           **kwargs)
         self.candidate_w_bits = candidate_w_bits
         self.candidate_a_bits = candidate_a_bits
-        self.active_quant_idx = 0  # default candidate index
+        self.active_w_idx = 0  # default candidate index for weights
+        self.active_a_idx = 0  # default candidate index for activations
 
-    def set_active_bitwidth(self, idx):
-        """Switch to the candidate bit‑width at index idx."""
-        self.active_quant_idx = idx
-        self.base_linear.w_bits = self.candidate_w_bits[idx]
-        self.base_linear.a_bits = self.candidate_a_bits[idx]
+    def set_active_bitwidth(self, w_idx, a_idx):
+        """Switch to the candidate bit‑widths at indices w_idx and a_idx."""
+        self.active_w_idx = w_idx
+        self.active_a_idx = a_idx
+        self.base_linear.w_bits = self.candidate_w_bits[w_idx]
+        self.base_linear.a_bits = self.candidate_a_bits[a_idx]
 
     def forward(self, input_):
         return self.base_linear(input_)
@@ -70,8 +72,8 @@ class QuantizeLinearWithLoRASwitchable(nn.Module):
     def set_active_lora(self, idx):
         self.active_lora_idx = idx
 
-    def set_active_bitwidth(self, idx):
-        self.switchable.set_active_bitwidth(idx)
+    def set_active_bitwidth(self, w_idx, a_idx):
+        self.switchable.set_active_bitwidth(w_idx, a_idx)
 
     def forward(self, input_):
         base_out = self.switchable(input_)
@@ -276,18 +278,20 @@ def set_active_lora(model, active_config):
             if hasattr(module, "set_active_lora"):
                 module.set_active_lora(active_idx)
 
-def set_active_quantization(model, active_quant_config):
+def set_active_quantization(model, active_w_config, active_a_config):
     """
-    active_quant_config: a list of integers with length equal to the number of layers.
-                         Each element specifies the active candidate index for the quantization
-                         parameters for that layer.
+    active_w_config: a list of integers with length equal to the number of layers.
+                     Each element specifies the active weight bitwidth index for that layer.
+    active_a_config: a list of integers with length equal to the number of layers.
+                     Each element specifies the active activation bitwidth index for that layer.
     """
     for layer_idx, block in enumerate(model.h):
-        active_idx = active_quant_config[layer_idx]
+        w_idx = active_w_config[layer_idx]
+        a_idx = active_a_config[layer_idx]
         for module in [block.attn.q_proj, block.attn.k_proj, block.attn.v_proj, block.attn.out_proj,
                        block.mlp.fc_in, block.mlp.fc_out]:
             if hasattr(module, "set_active_bitwidth"):
-                module.set_active_bitwidth(active_idx)
+                module.set_active_bitwidth(w_idx, a_idx)
 
 ###############################################################################
 # 8. Testing LoRA and Switchable Quantization Functionality
@@ -333,7 +337,7 @@ if __name__ == "__main__":
     # 3. Get base output (no LoRA, default quantization candidate index 0).
     print("\n3. Testing Base Model Output...")
     model.zero_grad()
-    set_active_quantization(model, [0] * num_layers)
+    set_active_quantization(model, [0] * num_layers, [0] * num_layers)
     with torch.no_grad():
         base_output = model(input_ids=input_ids, attention_mask=attention_mask)
         print(f"Base output shape: {base_output.shape}")
@@ -350,7 +354,7 @@ if __name__ == "__main__":
     
     # 5. Test switching quantization candidate to index 1 (e.g., using 8-bit instead of 4-bit).
     print("\n5. Testing switching quantization candidate to index 1...")
-    set_active_quantization(model, [1] * num_layers)
+    set_active_quantization(model, [1] * num_layers, [1] * num_layers)
     with torch.no_grad():
         switched_output = model(input_ids=input_ids, attention_mask=attention_mask)
         diff_switched = torch.abs(base_output - switched_output)

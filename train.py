@@ -73,9 +73,11 @@ def train(total_steps=1000):
             # Loop over candidate indices.
 
             # Randomly select quantization and LoRA configurations
-            rand_bit_indices = [random.choice(range(len(candidate_w_bits))) for _ in range(num_layers)]
-            set_active_quantization(model, rand_bit_indices)
-            print(f"\nQuantization choices: {rand_bit_indices}")
+            rand_w_bit_indices = [random.choice(range(len(candidate_w_bits))) for _ in range(num_layers)]
+            rand_a_bit_indices = [random.choice(range(len(candidate_a_bits))) for _ in range(num_layers)]
+            set_active_quantization(model, rand_w_bit_indices, rand_a_bit_indices)
+            print(f"\nWeight bitwidth choices: {rand_w_bit_indices}")
+            print(f"Activation bitwidth choices: {rand_a_bit_indices}")
             
             lora_choices = [random.choice([0, 1]) for _ in range(num_layers)]
             set_active_lora(model, lora_choices)
@@ -110,4 +112,4 @@ def train(total_steps=1000):
     return model
 
 if __name__ == "__main__":
-    train(total_steps=3)
+    train(total_steps=5)

@@ -4,9 +4,10 @@ from transformers import GPT2Tokenizer, GPT2Config, AdamW
 from new_quantized_gpt2 import GPT2QuantModel, set_active_lora
 from load_squad import load_squad
 from data_utils import collate_fn
+from model_utils import save_model
 import random
 
-def train():
+def train(total_steps=1000):
     print("Starting training setup...")
     print("========================")
     
@@ -55,7 +56,6 @@ def train():
     
     # 6. Training loop
     print("\n6. Starting training...")
-    total_steps = 1000
     step = 0
     
     while step < total_steps:
@@ -95,7 +95,12 @@ def train():
             if step >= total_steps:
                 break
     
+    # Save the model after training
+    print("\nSaving trained model...")
+    save_model(model)
+    
     print("\nTraining completed!")
+    return model
 
 if __name__ == "__main__":
-    train() 
+    train(total_steps=1000) 

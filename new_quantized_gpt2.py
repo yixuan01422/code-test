@@ -171,9 +171,10 @@ class GPT2QuantModel(GPT2PreTrainedModel):
         super().__init__(config)
         if len(layer_bit_config) != config.n_layer:
             raise ValueError("Length of layer_bit_config must equal n_layer.")
+        self.config = config
         self.layer_bit_config = layer_bit_config
+        self.lora_configs = lora_configs
         self.embed_dim = config.n_embd
-
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.n_positions, self.embed_dim)
         self.h = nn.ModuleList([

@@ -15,7 +15,7 @@ def log_message(message, log_file):
     with open(log_file, 'a') as f:
         f.write(message + '\n')
 
-def train(total_steps=1000):
+def train_random_bits(total_steps=1000):
     # Create logs directory if it doesn't exist
     os.makedirs('logs', exist_ok=True)
     
@@ -123,7 +123,7 @@ def train(total_steps=1000):
     
     # 7. Save the model after training.
     log_message("\nSaving trained model...", log_file)
-    save_model(model)
+    save_model(model, training_method="random_bits")
     
     log_message("\nTraining completed!", log_file)
     return model
@@ -217,7 +217,7 @@ def train_fixed_bits(total_steps=1000, w_bits=8, a_bits=8):
     
     # 7. Save the model after training.
     log_message("\nSaving trained model...", log_file)
-    save_model(model)
+    save_model(model, training_method="fixed_bits")
     
     log_message("\nTraining completed!", log_file)
     return model
@@ -327,7 +327,7 @@ def train_cyclic_bits(total_steps=1000, steps_per_config=100):
     
     # 7. Save the model after training.
     log_message("\nSaving trained model...", log_file)
-    save_model(model)
+    save_model(model, training_method="cyclic_bits")
     
     log_message("\nTraining completed!", log_file)
     return model
@@ -336,4 +336,4 @@ if __name__ == "__main__":
     # Example usage:
     # train_fixed_bits(total_steps=1000, w_bits=8, a_bits=8)  # Train with fixed 8-bit configuration
     # train_cyclic_bits(total_steps=1000)  # Train with cyclic configurations
-    train(total_steps=5)  # Original random configuration training
+    train_random_bits(total_steps=5)  # Original random configuration training

@@ -42,9 +42,10 @@ def f1_score(prediction, ground_truth):
     return f1
 
 def evaluate_squad(model, dataloader, tokenizer, device, num_samples=10):
-    """Evaluate model on SQuAD validation set using F1 score"""
+    """Evaluate model on SQuAD validation set using F1 score and loss"""
     model.eval()
     total_f1 = 0.0
+    total_loss = 0.0
     total = 0
     
     # Take a random subset of samples
@@ -56,15 +57,28 @@ def evaluate_squad(model, dataloader, tokenizer, device, num_samples=10):
     
     print(f"\nEvaluating on {len(samples)} samples...")
     
+    # Create LM head with weight tying (same as in training)
+    lm_head = torch.nn.Linear(model.embed_dim, model.config.vocab_size, bias=False)
+    lm_head.weight = model.wte.weight
+    lm_head = lm_head.to(device)
+    
     with torch.no_grad():
         for batch in samples:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
+            labels = input_ids.clone()
             
-            # Get model's prediction
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            # The output is already the logits tensor
-            logits = outputs
+            # Get model's prediction and apply LM head (same as training)
+            hidden_states = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = lm_head(hidden_states)
+            
+            # Calculate loss (same as training)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            
+            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            total_loss += loss.item()
             
             # Get the predicted answer (greedy decoding)
             predicted_ids = torch.argmax(logits, dim=-1)
@@ -84,12 +98,19 @@ def evaluate_squad(model, dataloader, tokenizer, device, num_samples=10):
                 print(f"Actual Answer: {actual_text}")
                 print(f"Predicted Answer: {predicted_text[:100]}...")
                 print(f"F1 Score: {f1:.4f}")
+                print(f"Loss: {loss.item():.4f}")
+    
+    if total == 0:
+        print("No samples were successfully evaluated")
+        return 0.0, float('inf')
     
     avg_f1 = total_f1 / total
+    avg_loss = total_loss / total
     print(f"\nEvaluation Results:")
     print(f"Average F1 Score: {avg_f1:.4f}")
+    print(f"Average Loss: {avg_loss:.4f}")
     
-    return avg_f1
+    return avg_f1, avg_loss
 
 def test_quantization_configs(model):
     print("Testing different quantization configurations...")
@@ -127,12 +148,13 @@ def test_quantization_configs(model):
             set_active_quantization(model, [w_idx] * num_layers, [a_idx] * num_layers)
             
             # Evaluate on SQuAD task
-            f1_score = evaluate_squad(model, val_loader, tokenizer, device)
+            f1_score, loss = evaluate_squad(model, val_loader, tokenizer, device)
             
             results.append({
                 'w_bits': w_bits,
                 'a_bits': a_bits,
-                'f1_score': f1_score
+                'f1_score': f1_score,
+                'loss': loss
             })
     
     # 3. Save results

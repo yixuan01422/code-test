@@ -1,143 +1,144 @@
+import os
+import json
 import torch
+import re
+import string
 from torch.utils.data import DataLoader
 from transformers import GPT2Tokenizer, GPT2Config
-from new_quantized_gpt2 import GPT2QuantModel
+from new_quantized_gpt2 import GPT2QuantModel, set_active_lora, set_active_quantization
 from load_squad import load_squad
-from model_utils import load_model
 from data_utils import collate_fn
-import numpy as np
-from tqdm import tqdm
-import json
-import os
+import random
+from collections import Counter
 
-def evaluate_model(model, tokenizer, eval_loader, device="cuda" if torch.cuda.is_available() else "cpu"):
-    """Evaluate model performance on validation set"""
+def normalize_answer(s):
+    """Lower text and remove punctuation, articles and extra whitespace."""
+    def remove_articles(text):
+        return re.sub(r'\b(a|an|the)\b', ' ', text)
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return ''.join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+def f1_score(prediction, ground_truth):
+    """Calculate token-level F1 score between prediction and ground truth."""
+    prediction_tokens = normalize_answer(prediction).split()
+    ground_truth_tokens = normalize_answer(ground_truth).split()
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0
+    precision = 1.0 * num_same / len(prediction_tokens)
+    recall = 1.0 * num_same / len(ground_truth_tokens)
+    f1 = (2 * precision * recall) / (precision + recall)
+    return f1
+
+def evaluate_squad(model, dataloader, tokenizer, device, num_samples=10):
+    """Evaluate model on SQuAD validation set using F1 score"""
     model.eval()
-    total_loss = 0
-    total_samples = 0
+    total_f1 = 0.0
+    total = 0
+    
+    # Take a random subset of samples
+    all_samples = list(dataloader)
+    if len(all_samples) > num_samples:
+        samples = random.sample(all_samples, num_samples)
+    else:
+        samples = all_samples
+    
+    print(f"\nEvaluating on {len(samples)} samples...")
     
     with torch.no_grad():
-        for batch in tqdm(eval_loader, desc="Evaluating"):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
+        for batch in samples:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
             
-            # Forward pass
-            hidden_states = model(input_ids=input_ids, attention_mask=attention_mask)
+            # Get model's prediction
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            # The output is already the logits tensor
+            logits = outputs
             
-            # Compute logits
-            logits = model.wte.weight @ hidden_states.transpose(-1, -2)
-            logits = logits.transpose(-1, -2)
+            # Get the predicted answer (greedy decoding)
+            predicted_ids = torch.argmax(logits, dim=-1)
+            predicted_text = tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
             
-            # Shift logits and labels for causal LM loss
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = input_ids[:, 1:].contiguous()
+            # Get the actual answer from the batch
+            actual_text = batch['answer_text'][0]
             
-            loss_fct = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            # Calculate F1 score
+            f1 = f1_score(predicted_text, actual_text)
+            total_f1 += f1
+            total += 1
             
-            total_loss += loss.item() * input_ids.size(0)
-            total_samples += input_ids.size(0)
+            # Print some examples
+            if total <= 3:  # Print first 3 examples
+                print(f"\nExample {total}:")
+                print(f"Actual Answer: {actual_text}")
+                print(f"Predicted Answer: {predicted_text[:100]}...")
+                print(f"F1 Score: {f1:.4f}")
     
-    avg_loss = total_loss / total_samples
-    perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    avg_f1 = total_f1 / total
+    print(f"\nEvaluation Results:")
+    print(f"Average F1 Score: {avg_f1:.4f}")
     
-    return {
-        "loss": avg_loss,
-        "perplexity": perplexity
-    }
+    return avg_f1
 
-def test_quantization_configs(model_path=None):
-    """Test different quantization configurations on SQuAD dataset"""
-    print("Loading SQuAD dataset...")
-    _, val_data = load_squad()
+def test_quantization_configs(model):
+    print("Testing different quantization configurations...")
+    print("=============================================")
     
-    # Initialize tokenizer
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    # 1. Load validation data
+    print("\n1. Loading validation data...")
+    _, val_data = load_squad()
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Prepare validation data loader
     val_loader = DataLoader(
-        val_data.select(range(100)),  # Use a subset for quick testing
-        batch_size=8,
+        val_data,
+        batch_size=1,  # Process one example at a time
         shuffle=False,
         collate_fn=lambda batch: collate_fn(batch, tokenizer)
     )
     
-    # Define different quantization configurations to test
-    base_config = GPT2Config()
-    num_layers = base_config.n_layer
-    
-    # Test configurations
-    configs = [
-        {
-            "name": "8-bit uniform",
-            "layer_bit_config": [[8, 8]] * num_layers
-        },
-        {
-            "name": "4-bit uniform",
-            "layer_bit_config": [[4, 4]] * num_layers
-        },
-        {
-            "name": "Mixed precision (8-4-8)",
-            "layer_bit_config": [[8, 8] if i % 3 != 1 else [4, 4] for i in range(num_layers)]
-        },
-        {
-            "name": "Mixed precision (8-4-4)",
-            "layer_bit_config": [[8, 8] if i == 0 else [4, 4] for i in range(num_layers)]
-        }
-    ]
-    
+    # 2. Test different quantization configurations
+    print("\n2. Testing different configurations...")
     results = []
     
-    for config in configs:
-        print(f"\nTesting configuration: {config['name']}")
-        
-        # Initialize model with current configuration
-        if model_path:
-            # Load pretrained model if path is provided
-            model, _, _, _ = load_model(model_path)
-            # Update quantization configuration
-            model.layer_bit_config = config["layer_bit_config"]
-        else:
-            # Create new model with current configuration
-            model = GPT2QuantModel(
-                base_config,
-                config["layer_bit_config"],
-                lora_configs=None  # No LoRA for evaluation
-            )
-        
-        # Move model to device
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = model.to(device)
-        
-        # Evaluate model
-        metrics = evaluate_model(model, tokenizer, val_loader, device)
-        
-        # Calculate model size
-        param_size = sum(p.numel() * p.element_size() for p in model.parameters())
-        buffer_size = sum(b.numel() * b.element_size() for b in model.buffers())
-        total_size = (param_size + buffer_size) / 1024**2  # Convert to MB
-        
-        results.append({
-            "config_name": config["name"],
-            "layer_bit_config": config["layer_bit_config"],
-            "metrics": metrics,
-            "model_size_mb": total_size
-        })
-        
-        print(f"Results for {config['name']}:")
-        print(f"  Loss: {metrics['loss']:.4f}")
-        print(f"  Perplexity: {metrics['perplexity']:.2f}")
-        print(f"  Model size: {total_size:.2f} MB")
+    # Test all combinations of weight and activation bitwidths
+    for w_idx in range(len(model.candidate_w_bits)):
+        for a_idx in range(len(model.candidate_a_bits)):
+            w_bits = model.candidate_w_bits[w_idx]
+            a_bits = model.candidate_a_bits[a_idx]
+            print(f"\nTesting w_bits={w_bits}, a_bits={a_bits}")
+            
+            # Set all layers to use the same bitwidth configuration
+            num_layers = model.config.n_layer
+            set_active_quantization(model, [w_idx] * num_layers, [a_idx] * num_layers)
+            
+            # Evaluate on SQuAD task
+            f1_score = evaluate_squad(model, val_loader, tokenizer, device)
+            
+            results.append({
+                'w_bits': w_bits,
+                'a_bits': a_bits,
+                'f1_score': f1_score
+            })
     
-    # Save results
+    # 3. Save results
+    print("\n3. Saving results...")
     os.makedirs("results", exist_ok=True)
     with open("results/quantization_results.json", "w") as f:
         json.dump(results, f, indent=2)
     
     return results
-
-if __name__ == "__main__":
-    # To evaluate a pretrained model, specify the path:
-    # results = test_quantization_configs("checkpoints/checkpoint_epoch0_step0.pt")
-    results = test_quantization_configs() 
